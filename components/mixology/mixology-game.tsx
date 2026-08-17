@@ -4,15 +4,25 @@
 // 玩家右侧气泡、小票全宽卡；全程无任何标签徽章，保沉浸。
 // 装饰材料的 CSS 以 <style> 注入本画面容器（认 .mix-* 官方语义类）。
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { ChevronLeft, Copy, CornerDownRight, History, Pencil, Plus, RotateCcw, Send, SlidersHorizontal, X } from "lucide-react";
-import { continueMix, editMixTurn, generateMixReply, mixTurnRawText, regenerateMixTail, rerollMixReply, truncateMixAfterTurn } from "@/lib/mixology/engine";
-import { getMixMaterial, getMixSession, listMixMaterials, saveMixSession } from "@/lib/mixology/storage";
-import { MIX_KIND_LABELS, MIX_SLOT_ORDER, mixEncoreRenderHtml, type MixCharacterCard, type MixMaterialKind, type MixSession, type MixTurn } from "@/lib/mixology/types";
+import { continueMix, editMixTurn, generateMixReply, mixTurnRawText, refreshMixOpening, regenerateMixTail, rerollMixReply, runMixSessionEnd, truncateMixAfterTurn } from "@/lib/mixology/engine";
+import { getMixMaterial, getMixSession, listMixPickables, resolveMixRecipeMaterials, saveMixSession } from "@/lib/mixology/storage";
+import { buildMixConditionContext, pickActiveMixMaterials } from "@/lib/mixology/state";
+import { scopeMixCss } from "@/lib/mixology/css-scope";
+import { MIX_KIND_LABELS, MIX_SLOT_ORDER, mixEncoreRenderHtml, mixSlotEntries, type MixCharacterCard, type MixFilterRule, type MixMaterialKind, type MixMechanismMaterial, type MixSession, type MixSlotEntry, type MixState, type MixTurn } from "@/lib/mixology/types";
+import { applyMixFilterRules } from "@/lib/mixology/prose";
 import { MixProseView } from "./prose-view";
 import { MixRichText } from "./rich-text";
 import { KindGlyph, MixConfirm } from "./mixology-shared";
 import { MixTicketFrame } from "./ticket-frame";
+import { MixMechanismPanel } from "./mechanism-panel";
+
+/** 当前真正挂着的对局：严格模式的重复挂载靠它区分「真退出」与「假卸载」 */
+/** 同时活动的常驻界面上限：每件一个 iframe，手机上多开吃内存，屏幕也摆不下 */
+const MIX_PANEL_MAX = 3;
+
+const liveMixGames = new Set<string>();
 
 type GameProps = {
     sessionId: string;
@@ -20,19 +30,21 @@ type GameProps = {
     onToast: (message: string) => void;
 };
 
-function AssistantTurn({ turn, ticketHtml, encoreHtml }: { turn: MixTurn; ticketHtml?: string; encoreHtml?: string }) {
-    // 展示顺序：状态栏在正文前、小剧场在正文后（模型的输出顺序不变，界面重排）
+function AssistantTurn({ turn, ticketHtml, encoreHtml, filterRules, state }: { turn: MixTurn; ticketHtml?: string; encoreHtml?: string; filterRules?: MixFilterRule[]; state?: MixState }) {
+    // 展示顺序：状态栏在正文前、小剧场在正文后（与模型的输出顺序一致，无需重排）
+    // 滤网「仅显示」模式在这里生效：存储不动，渲染前替换，历史消息也即时生效
+    const shownText = applyMixFilterRules(turn.text, filterRules, "display");
     return (
         <>
             {ticketHtml && turn.ticketRaw ? (
                 <div className="mix-ticket-wrap">
-                    <MixTicketFrame html={ticketHtml} raw={turn.ticketRaw} />
+                    <MixTicketFrame html={ticketHtml} raw={turn.ticketRaw} state={state} />
                 </div>
             ) : null}
-            {turn.text ? <MixProseView text={turn.text} /> : null}
+            {shownText ? <MixProseView text={shownText} /> : null}
             {encoreHtml && turn.encoreRaw ? (
                 <div className="mix-encore-turn">
-                    <MixTicketFrame html={encoreHtml} raw={turn.encoreRaw} />
+                    <MixTicketFrame html={encoreHtml} raw={turn.encoreRaw} state={state} />
                 </div>
             ) : null}
         </>
@@ -66,10 +78,44 @@ function TurnActions({
     );
 }
 
+/**
+ * 记住的值：顶栏下的一条横条，点开看全部。
+ * 没有任何值时整条不存在——没配小票的对局界面不变。
+ */
+function StateBar({ state }: { state: MixState }) {
+    const [open, setOpen] = useState(false);
+    const items = Object.entries(state);
+    if (!items.length) return null;
+    return (
+        <div className="mix-state-bar" data-open={open ? "true" : undefined}>
+            <button type="button" className="mix-state-strip" onClick={() => setOpen((v) => !v)}>
+                {items.slice(0, 3).map(([name, value]) => (
+                    <span className="mix-state-chip" key={name}>
+                        <i>{name}</i>
+                        <b>{String(value)}</b>
+                    </span>
+                ))}
+                {items.length > 3 ? <span className="mix-state-more">+{items.length - 3}</span> : null}
+            </button>
+            {open ? (
+                <div className="mix-state-panel">
+                    {items.map(([name, value]) => (
+                        <div className="mix-state-row" key={name}>
+                            <span>{name}</span>
+                            <b>{String(value)}</b>
+                        </div>
+                    ))}
+                </div>
+            ) : null}
+        </div>
+    );
+}
+
 export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
     const [session, setSession] = useState<MixSession | null>(() => getMixSession(sessionId));
     const [input, setInput] = useState("");
     const [busy, setBusy] = useState(false);
+    const busyRef = useRef(false);
     const [editing, setEditing] = useState<{ id: string; draft: string } | null>(null);
     const [confirm, setConfirm] = useState<{ type: "rewind" | "edit"; turnId: string } | null>(null);
     const [recipeOpen, setRecipeOpen] = useState(false);
@@ -96,19 +142,27 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
 
     // 封面 / 小票渲染代码 / 装饰 CSS：按方案槽位从酒柜现取
     const assets = useMemo(() => {
-        if (!session) return { cover: "", ticketHtml: undefined as string | undefined, garnishCss: "", encoreTurnHtml: undefined as string | undefined, encoreStaticHtml: "", canvasHtml: "" };
-        const slots = session.recipe.slots;
-        const character = slots.character ? getMixMaterial(slots.character) : null;
-        const ticket = slots.ticket ? getMixMaterial(slots.ticket) : null;
-        const garnish = slots.garnish ? getMixMaterial(slots.garnish) : null;
-        const encore = slots.encore ? getMixMaterial(slots.encore) : null;
+        if (!session) return { cover: "", ticketHtml: undefined as string | undefined, garnishCss: "", encoreTurnHtml: undefined as string | undefined, encoreStaticHtml: "", canvasHtml: "", filterRules: undefined as MixFilterRule[] | undefined };
+        // 渲染侧同样吃生效条件：夜里才生效的装饰、到点才演的小剧场，靠的就是这一步
+        const { entries } = resolveMixRecipeMaterials(session.recipe);
+        const active = pickActiveMixMaterials(entries, buildMixConditionContext(session));
+        const character = active.character?.[0] ?? null;
+        const ticket = active.ticket?.[0] ?? null;
+        const encore = active.encore?.[0] ?? null;
+        // 装饰与滤网是累加型：条件命中的几件按顺序叠加 / 串联
+        const garnishCss = (active.garnish ?? [])
+            .map((m) => (m.kind === "garnish" ? m.css.trim() : ""))
+            .filter(Boolean)
+            .join("\n\n");
+        const filterRules = (active.filter ?? []).flatMap((m) => (m.kind === "filter" ? m.rules : []));
         const encoreMat = encore?.kind === "encore" ? encore : null;
         const encoreRender = encoreMat ? mixEncoreRenderHtml(encoreMat).trim() : "";
         const encoreHasContract = Boolean(encoreMat?.contract?.trim());
         return {
             cover: character?.cover ?? "",
             ticketHtml: ticket?.kind === "ticket" ? ticket.renderHtml : undefined,
-            garnishCss: garnish?.kind === "garnish" ? garnish.css : "",
+            garnishCss,
+            filterRules: filterRules.length ? filterRules : undefined,
             // 写了契约 = AI 小剧场（按轮渲染）；没写契约 = 静态小品（挂在对话末尾）
             encoreTurnHtml: encoreHasContract && encoreRender ? encoreRender : undefined,
             encoreStaticHtml: !encoreHasContract ? encoreRender : "",
@@ -117,12 +171,79 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
         };
     }, [session]);
 
+    /**
+     * 条件命中、且配了停靠位的机括：这些是要常驻在画面边上的界面。
+     * 上限 3 件——每件一个 iframe，手机上多开吃内存，屏幕也摆不下。
+     */
+    const panels = useMemo(() => {
+        if (!session) return [] as MixMechanismMaterial[];
+        const { entries } = resolveMixRecipeMaterials(session.recipe);
+        const active = pickActiveMixMaterials(entries, buildMixConditionContext(session));
+        return (active.mechanism ?? [])
+            .filter((m): m is MixMechanismMaterial => m.kind === "mechanism" && Boolean(m.dock) && Boolean(m.panelHtml?.trim()))
+            .slice(0, MIX_PANEL_MAX);
+    }, [session]);
+
+    /** 界面写自己的存储 */
+    const handlePanelStore = useCallback((materialId: string, store: Record<string, string>) => {
+        const current = getMixSession(sessionId);
+        if (!current) return;
+        saveMixSession({ ...current, mechanismStore: { ...(current.mechanismStore ?? {}), [materialId]: store } });
+        setSession(getMixSession(sessionId));
+    }, [sessionId]);
+
+    /** 界面写记住的值 */
+    const handlePanelState = useCallback((patch: Record<string, string | number>) => {
+        const current = getMixSession(sessionId);
+        if (!current) return;
+        saveMixSession({ ...current, state: { ...(current.state ?? {}), ...patch } });
+        setSession(getMixSession(sessionId));
+    }, [sessionId]);
+
+    /**
+     * 把记住的值挂成对局根节点上的 CSS 变量，装饰里可以直接用：
+     *   .mix-game { background: hsl(calc(var(--mix-state-好感度) * 2) 40% 12%); }
+     * 变量名里的空白和引号会被换成下划线，避免拼出非法的自定义属性名。
+     */
+    const stateCssVars = useMemo(() => {
+        const vars: Record<string, string> = {};
+        for (const [name, value] of Object.entries(session?.state ?? {})) {
+            const safe = name.trim().replace(/[\s"'\\;:{}()]/g, "_");
+            if (safe) vars[`--mix-state-${safe}`] = String(value);
+        }
+        return vars as CSSProperties;
+    }, [session?.state]);
+
     useEffect(() => {
         const el = scrollRef.current;
         if (el) el.scrollTop = el.scrollHeight;
     }, [session?.turns.length, busy]);
 
     useEffect(() => () => abortRef.current?.abort(), []);
+
+    // 进对局：还没开口的局用当前角色卡重取开场白。
+    // 开场白是建局时写死进 turns[0] 的一条消息，作者改完卡回来本来看不到新的那句；
+    // 已经聊过的局不动（refreshMixOpening 自己判），那是真实历史。
+    useEffect(() => {
+        const res = refreshMixOpening(sessionId);
+        if (res?.changed) {
+            setSession(res.session);
+            onToast("开场白已更新为角色卡最新的一版。");
+        }
+    }, [sessionId, onToast]);
+
+    // 退出对局：跑一次收摊钩子并收掉这一局的全部沙盒，别让它们挂在页面上。
+    // 延后一拍再判：开发期的严格模式会「挂载 → 立刻卸载 → 再挂载」，
+    // 直接在清理函数里收摊会在刚进对局时就把这一局收掉。
+    useEffect(() => {
+        liveMixGames.add(sessionId);
+        return () => {
+            liveMixGames.delete(sessionId);
+            window.setTimeout(() => {
+                if (!liveMixGames.has(sessionId)) void runMixSessionEnd(sessionId);
+            }, 0);
+        };
+    }, [sessionId]);
 
     if (!session) {
         return (
@@ -141,6 +262,7 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
         const controller = new AbortController();
         abortRef.current = controller;
         setBusy(true);
+        busyRef.current = true;
         try {
             const pending = action(controller.signal);
             // 引擎的同步部分已经落库（重说删掉旧轮 / 发送写入用户消息），
@@ -153,6 +275,7 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
             const message = error instanceof Error ? error.message : "生成失败，请重试。";
             if (!controller.signal.aborted) onToast(message);
         } finally {
+            busyRef.current = false;
             setBusy(false);
         }
     };
@@ -163,6 +286,12 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
         setInput("");
         void run((signal) => generateMixReply(sessionId, text, signal));
     };
+
+    /** 界面以玩家身份发一句话：走的是和输入框一模一样的路径，不是特权通道 */
+    const handlePanelSay = useCallback((text: string) => {
+        if (busyRef.current) return;
+        void run((signal) => generateMixReply(sessionId, text, signal));
+    }, [sessionId]);
 
     const copyTurn = (turn: MixTurn) => {
         const done = () => onToast("已复制");
@@ -209,10 +338,13 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
         }
     };
 
-    /** 换料：改本局方案快照的槽位，下一轮装配时生效 */
+    /**
+     * 换料：改本局方案快照的槽位，下一轮装配时生效。
+     * 对局里是快捷单换——整格换成挑中的这一件；要叠料和设生效条件请回吧台改方案。
+     */
     const setSlot = (kind: MixMaterialKind, materialId: string | undefined) => {
         const slots = { ...session.recipe.slots };
-        if (materialId) slots[kind] = materialId;
+        if (materialId) slots[kind] = [{ materialId }];
         else delete slots[kind];
         const updated: MixSession = { ...session, recipe: { ...session.recipe, slots }, updatedAt: Date.now() };
         saveMixSession(updated);
@@ -225,8 +357,9 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
     const canReroll = !busy && lastTurn?.role === "assistant" && session.turns.length > 1;
 
     return (
-        <div className="mix-game">
-            {assets.garnishCss ? <style>{assets.garnishCss}</style> : null}
+        <div className="mix-game mix-garnish-scope" style={stateCssVars}>
+            {/* 装饰是可分享材料里唯一直接进主文档的代码，注入前先收口到本画面 */}
+            {assets.garnishCss ? <style>{scopeMixCss(assets.garnishCss)}</style> : null}
             <div className="mix-game-bg" style={assets.cover ? { backgroundImage: `url(${assets.cover})` } : undefined} />
             <div className="mix-game-header">
                 <button type="button" className="mix-icon-btn" onClick={onBack} aria-label="返回"><ChevronLeft size={20} /></button>
@@ -235,6 +368,7 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
                     <SlidersHorizontal size={17} />
                 </button>
             </div>
+            <StateBar state={session.state ?? {}} />
             <div className="mix-game-scroll" ref={scrollRef}>
                 {assets.canvasHtml ? (
                     <div className="mix-game-canvas">
@@ -261,7 +395,7 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
                         </div>
                     ) : (
                         <div className="mix-assistant-turn" key={turn.id}>
-                            <AssistantTurn turn={turn} ticketHtml={assets.ticketHtml} encoreHtml={assets.encoreTurnHtml} />
+                            <AssistantTurn turn={turn} ticketHtml={assets.ticketHtml} encoreHtml={assets.encoreTurnHtml} filterRules={assets.filterRules} state={turn.state} />
                             {actions}
                         </div>
                     );
@@ -277,6 +411,24 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
                     </div>
                 ) : null}
             </div>
+            {panels.length ? (
+                <div className="mix-panel-layer">
+                    {panels.map((material) => (
+                        <MixMechanismPanel
+                            key={material.id}
+                            materialId={material.id}
+                            name={material.name}
+                            dock={material.dock!}
+                            html={material.panelHtml ?? ""}
+                            state={session.state ?? {}}
+                            store={session.mechanismStore?.[material.id] ?? {}}
+                            onStore={handlePanelStore}
+                            onState={handlePanelState}
+                            onSay={handlePanelSay}
+                        />
+                    ))}
+                </div>
+            ) : null}
             <div className="mix-game-inputbar">
                 <button
                     type="button"
@@ -330,8 +482,9 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
                             <div className="mix-bar-hint">左右滑动切换槽位 · 点击槽位换材料</div>
                             <div className="mix-wheel" ref={wheelRef} onScroll={handleWheelScroll}>
                                 {MIX_SLOT_ORDER.map((kind) => {
-                                    const id = session.recipe.slots[kind];
-                                    const mat = id ? getMixMaterial(id) : null;
+                                    const stack = mixSlotEntries(session.recipe.slots, kind);
+                                    const mat = stack[0] ? getMixMaterial(stack[0].materialId) : null;
+                                    const extra = stack.length - 1;
                                     const locked = kind === "character";
                                     return (
                                         <div
@@ -354,7 +507,7 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
                                                         ) : (
                                                             <div className="mix-slot-glyph"><KindGlyph kind={kind} size={34} /></div>
                                                         )}
-                                                        <div className="mix-slot-name">{mat.name}</div>
+                                                        <div className="mix-slot-name">{mat.name}{extra > 0 ? ` +${extra}` : ""}</div>
                                                         {mat.hook ? <div className="mix-slot-hook">{mat.hook}</div> : null}
                                                     </>
                                                 ) : locked ? (
@@ -392,7 +545,7 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
                         </div>
                         <div className="mix-sheet-body">
                             <div className="mix-mat-list">
-                                {session.recipe.slots[slotPick] ? (
+                                {mixSlotEntries(session.recipe.slots, slotPick).length ? (
                                     <div className="mix-mat-row" onClick={() => setSlot(slotPick, undefined)}>
                                         <div className="mix-mat-row-glyph"><X size={18} /></div>
                                         <div className="mix-mat-info">
@@ -400,19 +553,19 @@ export function MixologyGame({ sessionId, onBack, onToast }: GameProps) {
                                         </div>
                                     </div>
                                 ) : null}
-                                {listMixMaterials(slotPick).map((m) => (
+                                {listMixPickables(slotPick).map((m) => (
                                     <div className="mix-mat-row" data-kind={m.kind} onClick={() => setSlot(slotPick, m.id)} key={m.id}>
                                         <div className="mix-mat-row-glyph"><KindGlyph kind={m.kind} size={22} /></div>
                                         <div className="mix-mat-info">
                                             <div className="mix-mat-name">
                                                 <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis" }}>{m.name}</span>
-                                                {session.recipe.slots[slotPick] === m.id ? <span className="mix-mat-badge">当前</span> : null}
+                                                {mixSlotEntries(session.recipe.slots, slotPick).some((e: MixSlotEntry) => e.materialId === m.id) ? <span className="mix-mat-badge">当前</span> : null}
                                             </div>
                                             {m.hook ? <div className="mix-mat-hook">{m.hook}</div> : null}
                                         </div>
                                     </div>
                                 ))}
-                                {listMixMaterials(slotPick).length === 0 ? (
+                                {listMixPickables(slotPick).length === 0 ? (
                                     <div className="mix-comment-empty">酒柜里还没有{MIX_KIND_LABELS[slotPick]}——去酒柜页自建一件。</div>
                                 ) : null}
                             </div>
